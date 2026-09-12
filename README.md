@@ -58,6 +58,20 @@ SHA-256 от неё, разные раскладки nonce/счётчика) —
 2. Запустить приложение, ввести **любые 12 символов** как ключ.
 3. Если есть ключ ядра — положить его в `/sdcard/Documents/OSIL/corekey.bin` и перезапустить.
 
+## Как проверить, что патч работает (logcat)
+
+```
+adb logcat | grep -i osil
+```
+
+* `environment ok (v=0)` — гейт целостности пропущен (патчи A/B);
+* `tier written: lunaware -> /sdcard/Documents/.tier` — лицензия выдана локально (патч C);
+* `network retry …`/`server unreachable`/`acquire status=…` — **не должно появляться вообще**
+  (обращения к серверу больше нет);
+* `no core to load - inert (key valid, but core unavailable)` — лицензия есть, но нет ключа ядра;
+* `core decrypted: …` и `core loaded from memfd jit-cache (…)` — ядро расшифровано и загружено
+  (значит, `corekey.bin` на месте и верный).
+
 ## Проверка
 
 ```
