@@ -810,6 +810,7 @@ install or re-enrollment
 | получение или продление grant | `issue_grant` / `renew_grant` | один раз на 24 часа или по явному renewal |
 | команда Telegram-бота | `status` | только по команде пользователя |
 | окончание локального countdown | `status` или `renew_grant` | один раз на границе истечения, если нет push/event channel |
+| запуск или resume с уже сохранённым grant | нет отдельного запроса | использовать сохранённый snapshot; проверка на следующей критической операции |
 | критическая server-backed операция | запрос операции | по факту операции |
 | revoke | server-side event или отклонение следующего запроса | без polling |
 
@@ -1608,7 +1609,8 @@ display_remaining = max(0, expires_at_server - server_now_at_sync - (monotonic_n
 Обновление:
 
 - перерисовывать countdown в реальном времени;
-- получить новый server snapshot один раз при запуске, восстановлении сессии или явном renewal;
+- получить новый server snapshot только при выдаче/renewal, отсутствии сохранённого grant или явном renewal;
+- при запуске с сохранённым grant не делать отдельный status-запрос только ради таймера;
 - не делать периодический polling backend каждые 30–60 секунд;
 - если приложение уже держит WebSocket или другой persistent channel, сервер отправляет событие `grant_expired` в момент окончания;
 - если persistent channel недоступен, при `display_remaining == 0` выполнить один status/renew запрос и получить от backend `EXPIRED`;
