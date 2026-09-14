@@ -54,9 +54,9 @@
 
 ---
 
-## 2. Диагностика текущей конструкции
+## 2. Диагностика конструкции
 
-Текущая реализация уже использует хорошие криптографические примитивы:
+Реализация использует хорошие криптографические примитивы:
 
 - XChaCha20-Poly1305 для seal и потокового grant;
 - ChaCha20-IETF для внутренних blob-данных;
@@ -100,7 +100,7 @@
 
 ### 2.2 Текущая оценка
 
-При наличии исходников и ELF текущую защиту разумно оценивать примерно как **5/10** против опытного реверсера. Против hex-патчера она выглядит сильнее, но это не тот threat model, на который нужно ориентироваться.
+При наличии исходников и ELF такую защиту разумно оценивать примерно как **5/10** против опытного реверсера. Против hex-патчера она выглядит сильнее, но это не тот threat model, на который нужно ориентироваться.
 
 ---
 
@@ -738,7 +738,7 @@ Red-team должен попробовать:
 4. Запретить локальную генерацию рабочего grant.
 5. Убрать долгоживущие token cache-файлы.
 6. Удалить подробные auth/crypto logs.
-7. Добавить server-side denylist для текущей уязвимой версии.
+7. Добавить server-side denylist для уязвимых версий.
 
 ### Этап 1 — новый протокол
 
@@ -834,3 +834,421 @@ heartbeat + revoke + key epoch
 - компрометация одной сессии не компрометирует весь продукт.
 
 **Честная оценка:** чисто клиентская обфускация и seal могут дать примерно 6–7/10 против массового патчинга. Практические 9–10/10 требуют server-authoritative архитектуры, hardware-backed identity, коротких capability и защищённого процесса выпуска. ChaCha20/XChaCha20, AES-GCM или другой примитив сами по себе не поднимут оценку, если атакующий может заменить код, который принимает решение о доверии.
+
+---
+
+## 17. Спецификация ключа устройства и 24-часового доступа
+
+### 17.1 Нельзя строить доверие на «неизменяемом файле»
+
+На rooted Android нет гарантированно доступного приложению файла, который одновременно:
+
+- уникален для каждого физического устройства;
+- никогда не меняется;
+- недоступен root;
+- одинаково читается на всех производителях;
+- сохраняется после сброса, перепрошивки и замены системных компонентов.
+
+Нельзя использовать как корень доверия:
+
+- `/etc/serial`;
+- `ro.serialno`;
+- `ro.boot.serialno`;
+- MAC/Bluetooth MAC;
+- IMEI или IMSI;
+- Android ID;
+- путь в `/data`;
+- любой файл, созданный самим приложением;
+- build fingerprint;
+- серийный номер, прочитанный через root.
+
+Такие значения могут отсутствовать, меняться, быть одинаковыми у нескольких устройств, сбрасываться после factory reset или подменяться с root.
+
+### 17.2 Правильная идентичность устройства
+
+Для security identity использовать не HWID-файл, а пару ключей:
+
+```text
+device_private_key
+    хранится в Android Keystore и не экспортируется
+
+device_public_key
+    отправляется серверу
+
+device_id = BLAKE2b(app_id || device_public_key)
+```
+
+`device_id` не является секретом и не должен быть настоящим серийным номером устройства. Он представляет конкретную установку/ключ. Уникальность обеспечивается криптографическим пространством публичных ключей, а не чтением системного файла.
+
+Для максимально стабильной привязки сервер дополнительно хранит:
+
+- certificate chain attestation;
+- package name;
+- digest сертификата подписи приложения;
+- app measurement/build ID;
+- оценку состояния bootloader;
+- риск-профиль устройства;
+- дату регистрации;
+- текущий `key_epoch`.
+
+Нужно честно учитывать, что переустановка приложения может создать новую key pair. Если требуется восстановление доступа после переустановки, оно должно делаться через аккаунт и серверную процедуру re-enrollment, а не через небезопасный HWID.
+
+### 17.3 Два разных ключа: постоянный device key и суточный access key
+
+Не нужно физически генерировать новую аппаратную пару каждый день. Это ухудшит совместимость, усложнит attestation и создаст много неиспользуемых Keystore aliases.
+
+Использовать две сущности:
+
+1. **Device identity key**
+   - создаётся один раз на установку;
+   - хранится в Keystore/TEE;
+   - используется для доказательства владения устройством;
+   - не экспортируется;
+   - публичная часть регистрируется на сервере.
+
+2. **24-hour access grant**
+   - выдаётся сервером на 24 часа;
+   - привязан к `device_public_key`, `device_id`, app build и game build;
+   - содержит ограниченный набор permissions;
+   - после истечения сервером считается недействительным;
+   - при продлении заменяется новым grant и новым `grant_id`.
+
+С точки зрения пользователя это выглядит как новый ключ каждые 24 часа, но постоянный аппаратный ключ остаётся якорем устройства.
+
+### 17.4 Регистрация устройства
+
+Поток регистрации:
+
+1. Сервер создаёт одноразовый `registration_nonce`.
+2. Клиент генерирует ECDSA P-256 key pair в Android Keystore.
+3. Клиент получает certificate chain attestation.
+4. Клиент подписывает `registration_nonce || app_id || build_id` приватным ключом.
+5. Клиент отправляет на сервер:
+   - license key;
+   - public key;
+   - certificate chain;
+   - подпись challenge;
+   - package name;
+   - app version;
+   - build ID;
+   - game fingerprint;
+   - Play Integrity token, если доступен.
+6. Сервер проверяет chain, подпись, nonce, build policy и лицензию.
+7. Сервер создаёт запись устройства и возвращает `device_id`.
+
+Приватный ключ нельзя сериализовать в файл, отправлять на сервер или помещать в native ELF.
+
+### 17.5 Выдача 24-часового ключа
+
+Серверный grant должен содержать минимум:
+
+```text
+version
+key_id
+grant_id
+device_id
+device_public_key_hash
+license_id_hash
+app_build_id
+game_build_id
+permissions
+issued_at
+expires_at
+server_time
+key_epoch
+session_nonce
+server_signature
+```
+
+`expires_at` вычисляется сервером. Клиентские часы не должны определять действительность ключа.
+
+Для защиты от переноса на другое устройство клиент должен доказать владение private key:
+
+```text
+server_nonce
++ grant_id
++ device_id
++ app_build_id
++ game_build_id
+```
+
+подписываются device key, а сервер проверяет подпись по зарегистрированному public key.
+
+### 17.6 Ротация через 24 часа
+
+При истечении срока:
+
+1. Старый `grant_id` становится недействительным.
+2. Сервер проверяет `key_epoch`, device key и текущую лицензию.
+3. Сервер создаёт новый `grant_id` и новый `session_nonce`.
+4. Сервер подписывает новый grant.
+5. Клиент удаляет старый plaintext grant и временные ключи.
+6. Сервер не принимает старый grant даже при правильной подписи, если `expires_at` прошёл.
+
+Для аварийного отзыва не ждать 24 часа: сервер должен иметь `revoked_at`, `revocation_epoch` или denylist по `device_id`, `grant_id` и `key_epoch`.
+
+### 17.7 Защита от копирования ключа на другое устройство
+
+Нельзя проверять только строку license key. Проверка должна быть такой:
+
+```text
+license key valid
+AND device public key registered
+AND proof-of-possession valid
+AND app build allowed
+AND game build allowed
+AND grant not expired
+AND grant not revoked
+AND session nonce fresh
+```
+
+Скопированная строка ключа на другом телефоне должна привести к тому же внешнему сообщению, что и любой недействительный ключ.
+
+### 17.8 Сообщения об ошибках
+
+Не раскрывать клиенту причину, которая помогает проверять HWID или перебирать состояние устройства.
+
+Внутренние server reason codes:
+
+```text
+INVALID_LICENSE
+DEVICE_MISMATCH
+DEVICE_NOT_REGISTERED
+ATTESTATION_FAILED
+APP_BUILD_REVOKED
+GAME_BUILD_UNSUPPORTED
+GRANT_EXPIRED
+GRANT_REVOKED
+REPLAY_DETECTED
+KEY_EPOCH_REVOKED
+```
+
+Клиентские сообщения:
+
+| Внутренний результат | Сообщение пользователю |
+|---|---|
+| `INVALID_LICENSE` | `Неверный ключ` |
+| `DEVICE_MISMATCH` | `Неверный ключ` |
+| `DEVICE_NOT_REGISTERED` | `Неверный ключ` |
+| `ATTESTATION_FAILED` | `Неверный ключ` |
+| `APP_BUILD_REVOKED` | `Неверный ключ` |
+| `GAME_BUILD_UNSUPPORTED` | `Неверный ключ` |
+| `GRANT_EXPIRED` | `Ключ истёк` |
+| `GRANT_REVOKED` | `Ключ отозван` |
+| `REPLAY_DETECTED` | `Неверный ключ` |
+| `KEY_EPOCH_REVOKED` | `Ключ истёк` |
+| network timeout | `Не удалось проверить ключ` |
+
+Не показывать:
+
+- `HWID mismatch`;
+- `device_id`;
+- hash публичного ключа;
+- attestation reason;
+- server database ID;
+- точное время последней регистрации;
+- информацию о том, зарегистрирован ли этот ключ на другом устройстве.
+
+### 17.9 Root-specific policy
+
+Поскольку приложение сознательно использует root, root нужно считать **режимом повышенного риска**, а не доверенной средой.
+
+Рекомендуемая политика:
+
+- device key всё равно создавать в Android Keystore;
+- не пытаться извлекать HWID из root-файлов;
+- Play Integrity использовать как риск-сигнал, а не как единственный критерий;
+- полный anti-patch claim не делать;
+- grant сделать device-bound и короткоживущим;
+- для root-mode использовать отдельный permission profile;
+- не выдавать универсальный master key;
+- не разрешать offline-продление;
+- продлевать доступ только после server proof-of-possession;
+- при подозрительном поведении отзывать `device_id` или `key_epoch`.
+
+Если требуется максимальная защита от патчинга, root-mode должен получать ограниченный capability. Полный доступ на rooted устройстве и гарантия непатчимого клиента несовместимы.
+
+---
+
+## 18. Совместимость с Android 11 и выше
+
+### 18.1 Базовый минимум
+
+Для целевой совместимости использовать Android 11/API 30 как минимальную версию приложения. Не требовать StrongBox как обязательное условие.
+
+Порядок выбора backend:
+
+```text
+StrongBox available and policy allows
+    -> StrongBox key
+
+StrongBox unavailable
+    -> TEE-backed Keystore key
+
+TEE attestation unavailable
+    -> compatibility policy or deny full capability
+```
+
+Ошибку отсутствия StrongBox нельзя считать ошибкой приложения. Это нормальный результат feature detection.
+
+### 18.2 Матрица режимов
+
+| Устройство | Device key | Attestation | Политика |
+|---|---:|---:|---|
+| Android 11+, TEE, Google Play | Да | Да | Full или root-risk policy |
+| Android 11+, StrongBox | Да | Да | Усиленный режим |
+| Android 11+, TEE без StrongBox | Да | Да | Обычный полный режим |
+| Android 11+, software-backed | Да | Нет/слабая | Ограниченный режим |
+| Android 11 без Google Play | Да | Зависит от OEM | Отдельная compatibility policy |
+| root/custom ROM | Да | Может не пройти | Root-risk/ограниченный режим |
+| repacked APK | Возможно | App integrity fail | Отказ |
+| эмулятор | Возможно | Обычно слабая | Отказ или demo |
+
+### 18.3 Что обязательно тестировать
+
+Минимальная матрица реальных устройств:
+
+- Pixel на Android 11;
+- Samsung на Android 11;
+- Xiaomi/Redmi на Android 11;
+- бюджетный OEM без StrongBox;
+- устройство без Google Play;
+- unlocked bootloader;
+- root/Magisk;
+- factory reset;
+- переустановка приложения;
+- восстановление backup;
+- смена системного времени;
+- отсутствие сети во время продления;
+- истечение grant во время активной сессии.
+
+Цель совместимости — чтобы приложение запускалось везде, где это разрешено политикой, а не чтобы каждое устройство получало одинаковый уровень доверия.
+
+---
+
+## 19. Обязательные изменения в исходниках
+
+Будущий implementation должен изменить исходники, а не только патчить уже собранный ELF.
+
+### Auth
+
+- убрать доверие к локальному `AUTH_OK`;
+- убрать локальный fallback, который даёт production capability;
+- добавить device registration;
+- добавить proof-of-possession;
+- добавить server-signed 24-hour grant;
+- проверять `issued_at`, `expires_at`, `key_epoch`, `grant_id` и nonce;
+- не хранить private key в файле;
+- удалять plaintext token после использования;
+- использовать server time;
+- отделить internal reason codes от UI messages.
+
+### Seal и payload
+
+- удалить universal embedded master secret;
+- выдавать payload key только для конкретной server session;
+- привязать AEAD associated data к device key, build ID, game build, grant ID и nonce;
+- не хранить offsets всех версий в одном клиенте;
+- не оставлять beta fallback в production release path;
+- очищать plaintext offsets после построения минимальной capability.
+
+### Server
+
+- хранить public key и hash device key;
+- не хранить private key клиента;
+- реализовать `key_epoch`;
+- реализовать revoke;
+- реализовать replay cache;
+- реализовать ежедневную ротацию grant;
+- проверять proof-of-possession;
+- выдавать одинаковое внешнее сообщение для mismatch и invalid license;
+- не принимать `rva`, `expires_at`, `device_id` и `integrity_ok` как доверенные значения от клиента.
+
+### Build
+
+- не помещать secrets в Git;
+- не помещать secrets в `build_secret.json` артефакты;
+- использовать HSM/KMS для server signing key;
+- подписывать update manifest;
+- тестировать отсутствие секретов через `strings`, entropy scan и binary diff;
+- сохранять provenance отдельно от секретов.
+
+---
+
+## 20. Точный prompt для нового AI-чата
+
+Ниже находится самостоятельное задание. Его можно целиком передать coding agent в новом чате.
+
+```text
+Ты coding agent Arena.ai. Работаешь в существующем Git-репозитории проекта xvcen. Сначала изучи структуру репозитория, git status, текущую ветку и все доступные исходники. Прочитай PROTECTION_HARDENING.md целиком. Если в workspace доступны исходники из /tmp/xvsrc или /tmp/xvcen.zip, используй их для анализа Auth, xvseal, game и build pipeline. Не доверяй текущему собранному ELF как источнику исходной логики: сначала отдели легитимную реализацию от любых offline/crack-патчей.
+
+Задача: реализовать реальную server-authoritative защиту приложения с поддержкой Android 11+ и root-режима. Не делать декоративную обфускацию и не обходиться одним локальным if. Критические решения должны приниматься сервером.
+
+Обязательные требования:
+
+1. Не использовать HWID-файл, serial, MAC, IMEI, IMSI, ro.serialno, Android ID или другой системный файл как корень доверия. На rooted Android нет гарантированно неизменяемого файла, уникального для каждого устройства.
+
+2. Создавать device identity key в Android Keystore. Использовать non-exportable ECDSA P-256 key, совместимый с Android 11/API 30. StrongBox использовать опционально. Если StrongBox отсутствует, корректно переходить к TEE. Не блокировать все устройства только из-за отсутствия StrongBox.
+
+3. Получать certificate chain Key Attestation и отправлять её на сервер. Attestation проверять только на сервере. Локальные поля isInsideSecureHardware, integrity_ok и device_id не считать доказательством доверия.
+
+4. Использовать device_id как hash app_id и device public key. Не показывать этот идентификатор пользователю и не выдавать его в ошибках.
+
+5. Разделить постоянный device identity key и 24-hour access grant. Постоянный private key хранится только в Keystore. Новый grant выдаётся сервером каждые 24 часа и не переносится на другое устройство.
+
+6. Grant должен быть привязан к device public key hash, app build ID, game build ID, grant ID, key_epoch, issued_at, expires_at, server nonce и permissions. Grant должен иметь server signature. Нельзя принимать от клиента rva, expires_at, device_id, permissions или integrity_ok как доверенные данные.
+
+7. Для каждого запроса регистрации, выдачи и продления использовать server nonce и proof-of-possession: клиент подписывает challenge device key, сервер проверяет подпись.
+
+8. Действительность ключа определять по времени сервера, а не по часам телефона. После 24 часов старый grant должен возвращаться как expired/revoked. Должна быть аварийная server-side revoke возможность через key_epoch и denylist.
+
+9. Если license key неверен, привязан к другому устройству, не зарегистрирован, attestation провалена, обнаружен replay или build отозван, наружу всегда возвращать одинаковое сообщение: «Неверный ключ». Не писать пользователю HWID mismatch, device mismatch, device id, public key hash или server reason.
+
+10. Если срок grant действительно закончился, показывать «Ключ истёк». Если сервер недоступен, показывать «Не удалось проверить ключ». Не смешивать эти случаи.
+
+11. Поддержать Android 11+ на устройствах с Google Play, без Google Play, без StrongBox, с TEE, с software-backed Keystore и в root/custom-ROM средах. Полный доступ выдавать только по серверной policy. В средах без attestation использовать compatibility/root-risk режим или отказ, но не подделывать trusted verdict.
+
+12. Так как приложение использует root, не заявлять, что client-side anti-patch возможен на 100 процентов. Защитить anti-cloning и device binding: root-режим должен получать короткоживущие scoped capabilities и не должен получать universal master key.
+
+13. Удалить embedded universal master secret из native ELF. Не хранить server signing private key, device private key, universal decrypt key и build secret в Git, APK, ELF, CI logs или артефактах.
+
+14. Для payload использовать domain-separated per-session keys. Криптографические примитивы выбирать из проверенной библиотеки: XChaCha20-Poly1305 или AES-GCM для AEAD, BLAKE2b/HKDF для KDF, Ed25519/ECDSA для server signature, X25519/ECDH для session key. Не писать собственную криптографию.
+
+15. Не передавать клиенту offsets всех версий. Выдавать только минимальный набор для текущего app/game build и текущих permissions. Не оставлять production beta fallback, который позволяет работать без server grant.
+
+16. Ввести server endpoints или эквивалентный строгий API для device registration, grant issue, grant renewal, heartbeat и revoke. Формат должен быть canonical CBOR, Protobuf или строгий бинарный формат. Не строить security-critical протокол на свободных строках без canonical encoding.
+
+17. Добавить replay cache, rate limit, key_epoch rotation, build revoke, device revoke, license revoke и audit telemetry без plaintext private keys, tokens или offsets в логах.
+
+18. Проверить итоговый Android/ELF build: PIE, RELRO, NOW, stack protector, FORTIFY, hidden visibility, отсутствие RWX, минимальные exports, отсутствие debug info и test endpoints. Включить CFI/LTO/PAC/BTI только если это совместимо с целевыми Android 11 устройствами.
+
+19. Добавить tests для регистрации, неверного ключа, чужого device key, истёкшего grant, replay, смены времени телефона, отсутствия сети, revoke, key_epoch rotation, переустановки, backup restore, root mode, no-GMS mode, software-backed Keystore и отсутствия StrongBox.
+
+20. Не делать вид, что backend реализован, если в репозитории нет backend-кода. Если для end-to-end реализации не хватает server части, создай чёткий API contract, migration plan и тестовый mock без production secrets, затем явно укажи, что требуется подключить на сервере.
+
+21. Не добавлять комментарии в исходный код, Java/Kotlin, C/C++, Python, shell, SQL или конфигурационные файлы. Код должен быть без комментариев. Документацию можно писать в Markdown.
+
+22. Не добавлять секреты, реальные license keys, private keys, attestation chains production devices или дампы токенов в репозиторий.
+
+23. Не делать offline bypass, unconditional AUTH_OK, fixed production RVA, fake attestation или локальное принятие решения вместо server validation.
+
+24. После реализации запусти доступные тесты и статические проверки, проверь git diff --check, размер и формат итоговых артефактов. Опиши ограничения Android 11, GMS, StrongBox и root режима честно.
+
+25. Работай только в текущей ветке сессии. Не удаляй .git и корень репозитория. В конце создай commit и push только в ветку сессии, затем укажи commit SHA, список изменённых файлов, тесты и ссылку на Pull Request.
+```
+
+---
+
+## 21. Финальный критерий
+
+Для rooted-приложения правильная формулировка цели не «невозможно пропатчить клиент», а:
+
+```text
+Нельзя клонировать лицензию на другое устройство.
+Нельзя получить универсальный master secret из ELF.
+Нельзя использовать старый 24-hour grant после истечения или revoke.
+Нельзя получить полный grant без proof-of-possession и server policy.
+Можно отозвать устройство, build и key epoch без обновления приложения.
+```
+
+Это достижимо на Android 11+ при многоуровневой policy. Абсолютная защита runtime-памяти rooted-клиента недостижима, поэтому её нельзя обещать пользователю или считать выполненной только из-за Keystore, StrongBox, Play Integrity или ChaCha20.
