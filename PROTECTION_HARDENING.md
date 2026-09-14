@@ -1247,7 +1247,7 @@ Private key не экспортировать и не сохранять в от
 
 25. Работай только в текущей ветке сессии. Не удаляй .git и корень репозитория. В конце создай commit и push только в ветку сессии, затем укажи commit SHA, список изменённых файлов, тесты и ссылку на Pull Request.
 
-26. Создай отдельного асинхронного Python Telegram-бота на aiogram 3.x. Используй httpx.AsyncClient, Pydantic v2, asyncpg или SQLAlchemy 2 async для PostgreSQL, redis.asyncio для locks и rate limits, orjson и uvloop при совместимости. Не использовать синхронный Telegram framework.
+26. Создай бота полностью на Cloudflare Workers Free без VPS, Container, PostgreSQL, Redis, polling и Workers Paid. Используй Python Workers runtime, workers-py, pywrangler, WorkerEntrypoint/fetch handler, Telegram webhook и D1 SQLite. Для HTTP используй проверенный в Python Workers httpx или native fetch через Workers FFI. Не использовать aiogram polling: для трёх inline-кнопок написать лёгкий webhook handler. Учитывать Free limits: 100000 Worker requests/day, 10 ms CPU/request, 50 external subrequests/request, 5 million D1 rows read/day, 100000 D1 rows written/day и 5 GB D1 storage.
 
 27. Не создавай ручные пользовательские или административные Telegram-команды. В каждом сообщении бота должны быть только три inline-кнопки: «Создать ключ», «Мой ключ» и «Помощь». Кнопка «Мой ключ» выводит всё: сам ключ в безопасном виде, статус, TTL, binding status и masked device ID. Не добавляй кнопки или действия «Продлить», «Проверить привязку», «Отозвать», «Обновить», «Назад» или «Проверить срок». Текст «По поводу помощи — @xvcey» показывать только после нажатия кнопки «Помощь». Бот всегда обращается к backend API.
 
@@ -1304,20 +1304,74 @@ Private key не экспортировать и не сохранять в от
 - не добавлять отдельные действия для продления, revoke, проверки binding или обновления;
 - показывать справку только после нажатия кнопки `Помощь`; текст справки: `По поводу помощи — @xvcey`.
 
-### 22.2 Рекомендуемый стек
+### 22.2 Cloudflare Workers Free как единственная платформа
 
-Для Telegram-бота использовать асинхронный стек:
+Для production-бота выбрать Cloudflare Workers Free. Не использовать отдельный VPS, Cloudflare Container, PostgreSQL, Redis, long polling или платный Workers Paid Plan.
 
-- Python 3.12+;
-- `aiogram 3.x` для Telegram Bot API;
-- `httpx.AsyncClient` для backend API;
-- `pydantic v2` и `pydantic-settings` для схем и конфигурации;
-- PostgreSQL через `asyncpg` или SQLAlchemy 2 async;
-- `redis.asyncio` для rate limit, FSM и коротких locks;
-- `orjson` для сериализации;
-- `uvloop` на Linux, если он доступен и протестирован.
+Архитектура:
 
-`aiogram 3.x` использовать как основной Telegram framework, потому что он асинхронный, поддерживает routers, middleware, FSM и callback handlers. Не использовать синхронный polling framework для production-бота.
+```text
+Telegram webhook
+    -> один Cloudflare Python Worker
+        -> inline callback handler
+            -> D1 SQLite
+                -> key/device/grant/audit records
+        -> endpoint для xvcen.sh и Android-клиента
+```
+
+Использовать:
+
+- Python Workers runtime;
+- `workers-py` и `pywrangler` для локальной разработки и deploy;
+- `WorkerEntrypoint` и `fetch` handler вместо постоянно работающего процесса;
+- Telegram webhook вместо polling;
+- `httpx` только если он проходит проверку Python Workers, иначе native `fetch` через Workers FFI;
+- Pydantic только для лёгкой валидации схем, если пакет доступен в текущем Python Workers runtime;
+- Cloudflare D1 для таблиц ключей, device bindings, grants, rate limits и audit;
+- Cloudflare Worker Secrets для Telegram token, webhook secret и service secrets;
+- Cloudflare Logs без plaintext ключей.
+
+Для этого бота нативный Python Worker быстрее и проще, чем `aiogram`: нужны только три inline-кнопки, webhook и несколько API actions. Не использовать aiogram polling в Worker. Если конкретная библиотека не собирается в Pyodide/PyEmscripten, не обходить ограничение контейнером: написать небольшой webhook handler на Workers SDK.
+
+FastAPI/Starlette официально поддерживаются Python Workers, но для этого маленького webhook использовать прямой `WorkerEntrypoint`, чтобы не тратить CPU Free plan на лишний framework layer.
+
+Официальные инструкции:
+
+- Python Workers: `https://developers.cloudflare.com/workers/languages/python/`;
+- Python packages и `pywrangler`: `https://developers.cloudflare.com/workers/languages/python/packages/`;
+- Workers limits: `https://developers.cloudflare.com/workers/platform/limits/`;
+- D1 limits и pricing: `https://developers.cloudflare.com/d1/platform/limits/` и `https://developers.cloudflare.com/d1/platform/pricing/`.
+
+### 22.2.1 Ограничения бесплатного плана
+
+Проект должен укладываться в текущие Free limits:
+
+| Ресурс | Free limit | Решение |
+|---|---:|---|
+| Worker requests | 100000 в сутки | webhook, без polling и heartbeat |
+| Worker CPU | 10 ms на HTTP request | короткие handlers, без тяжёлых вычислений |
+| External subrequests | 50 на request | один Telegram API call и минимум backend calls |
+| Worker size | 64 MiB | без тяжёлых зависимостей |
+| D1 reads | 5 млн строк в сутки | индексы по key hash и user/device ID |
+| D1 writes | 100000 строк в сутки | идемпотентные create и короткий audit |
+| D1 storage | 5 GB суммарно | удалять старые audit records по retention policy |
+| D1 databases | 10 | использовать одну базу |
+
+При превышении Free quota операции могут временно возвращать ошибку до сброса лимита. Бот должен показывать `Не удалось проверить ключ`, а не создавать grant локально.
+
+### 22.2.2 Webhook и storage flow
+
+1. Telegram отправляет update на `/telegram/webhook/<secret-path>`.
+2. Worker проверяет Telegram webhook secret.
+3. Worker принимает только callback actions или технический `/start`.
+4. Worker проверяет Telegram user ID и action token.
+5. Для `Создать ключ` выполняется одна идемпотентная транзакция D1.
+6. Для `Мой ключ` выполняется один индексированный status query D1.
+7. Для `Помощь` запрос к D1 не выполняется.
+8. Worker редактирует существующее Telegram-сообщение и снова добавляет три inline-кнопки.
+9. Вызов backend для Android/xvcen.sh использует отдельные `/v1/auth/*` endpoints того же Worker.
+
+Не делать Cron Trigger для проверки истечения ключей. Истечение вычисляется при обращении или через уже открытый event channel, а не обходом всех строк в D1.
 
 ### 22.3 Безопасность бота
 
@@ -1341,7 +1395,7 @@ Telegram-бот не должен содержать:
 - любые backend actions проверяют Telegram user ID и роль;
 - service credential можно отозвать без выпуска нового клиента.
 
-Токены и ключи нельзя писать в stdout, systemd logs, Redis без TTL или Telegram callback data.
+Токены и ключи нельзя писать в Workers Logs, D1 audit, callback data или Worker responses.
 
 ### 22.4 Только три inline-кнопки
 
@@ -1459,7 +1513,7 @@ XVCEN-ABCDE
 7. возвращать `Неверный ключ` для неверного формата, неизвестного ключа, чужого устройства и failed proof;
 8. возвращать `Ключ истёк` только после ответа backend о реальном истечении.
 
-Backend проверяет hash ключа, статус, account binding, device binding, `key_epoch`, `issued_at`, `expires_at`, replay nonce и server policy. Никакого списка допустимых ключей, фиксированного ключа или локального `AUTH_OK` в `xvcen.sh` не оставлять.
+Backend проверяет hash ключа, статус, account binding, device binding, `key_epoch`, `issued_at`, `expires_at`, replay nonce и server policy. Никакого списка допустимых ключей, фиксированного ключа или локального `AUTH_OK` в `xvcen.sh` не оставлять. В Free deployment этим backend является тот же Cloudflare Python Worker через `/v1/auth/*`; D1 остаётся источником истины, а `xvcen.sh` не обращается к D1 напрямую.
 
 ### 22.8 Binding status внутри «Мой ключ»
 
@@ -1588,6 +1642,7 @@ Telegram не предназначен для редактирования со�
 15. Кнопка `Помощь` показывает ровно `По поводу помощи — @xvcey` и не выполняет key operation.
 16. В обычных сообщениях нет текста помощи без нажатия `Помощь`.
 17. В каждом сообщении ровно три inline-кнопки: `Создать ключ`, `Мой ключ`, `Помощь`.
+18. Worker разворачивается на Cloudflare Workers Free через `pywrangler deploy`, Telegram webhook отвечает, D1 подключён, а приложение не использует PostgreSQL, Redis, Container или polling.
 
 ---
 
@@ -1698,7 +1753,7 @@ NETWORK_ERROR
 В prompt для coding agent обязательно добавить следующие требования:
 
 ```text
-26. Создай отдельного асинхронного Python Telegram-бота на aiogram 3.x. Используй httpx.AsyncClient, Pydantic v2, asyncpg или SQLAlchemy 2 async для PostgreSQL, redis.asyncio для locks и rate limits, orjson и uvloop при совместимости. Не использовать синхронный Telegram framework.
+26. Создай бота полностью на Cloudflare Workers Free без VPS, Container, PostgreSQL, Redis, polling и Workers Paid. Используй Python Workers runtime, workers-py, pywrangler, WorkerEntrypoint/fetch handler, Telegram webhook и D1 SQLite. Для HTTP используй проверенный в Python Workers httpx или native fetch через Workers FFI. Не использовать aiogram polling: для трёх inline-кнопок написать лёгкий webhook handler. Учитывать Free limits: 100000 Worker requests/day, 10 ms CPU/request, 50 external subrequests/request, 5 million D1 rows read/day, 100000 D1 rows written/day и 5 GB D1 storage.
 
 27. Не создавай ручные пользовательские или административные Telegram-команды. В каждом сообщении бота должны быть только три inline-кнопки: «Создать ключ», «Мой ключ» и «Помощь». Кнопка «Мой ключ» выводит всё: сам ключ в безопасном виде, статус, TTL, binding status и masked device ID. Не добавляй кнопки или действия «Продлить», «Проверить привязку», «Отозвать», «Обновить», «Назад» или «Проверить срок». Текст «По поводу помощи — @xvcey» показывать только после нажатия кнопки «Помощь». Бот всегда обращается к backend API.
 
