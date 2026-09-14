@@ -196,7 +196,7 @@ Key Attestation, TEE, StrongBox и Play Integrity не должны быть о�
 
 ### 4.4 Важное ограничение
 
-Аппаратная аттестация подтверждает состояние установки и устройства на момент проверки. Она не гарантирует, что легитимный процесс невозможно отлаживать после запуска. Поэтому token должен быть короткоживущим, capability — минимальной, а сервер должен регулярно проверять heartbeat и риск-сигналы.
+Аппаратная аттестация подтверждает состояние установки и устройства на момент проверки. Она не гарантирует, что легитимный процесс невозможно отлаживать после запуска. Поэтому grant должен быть server-issued и device-bound. Сервер проверяет его на критических операциях; постоянный polling для UI не используется.
 
 ---
 
@@ -278,16 +278,17 @@ Grant {
 
 ### 5.4 TTL и отзыв
 
-Рекомендуемые значения:
+Для этого проекта действует одна нормативная схема:
 
-- bootstrap challenge: 30–120 секунд;
-- access token: 5–15 минут;
-- offsets capability: 1–5 минут либо до смены game session;
-- heartbeat: 30–90 секунд;
-- refresh token: только server-side либо аппаратно привязанный;
-- мгновенный revoke через denylist/key epoch.
+- bootstrap challenge используется один раз при регистрации или re-enrollment;
+- server-issued access grant действует 24 часа;
+- `expires_at` вычисляет только сервер;
+- UI считает countdown локально и не делает запросы каждую секунду или каждые 30–60 секунд;
+- при наличии уже открытого persistent channel сервер может отправить `grant_expired`;
+- без такого канала клиент делает один status/renew запрос на границе истечения или при следующем критическом действии;
+- revoke выполняется через denylist или `key_epoch` без ожидания окончания 24 часов.
 
-24-часовой token удобен, но слишком дорог для защиты. Если нужен offline-cache, он должен давать только ограниченную non-sensitive функциональность и не должен содержать рабочий decrypt key.
+Если критическая функция должна быть недоступна сразу после истечения, она не может зависеть только от локального `expires_at`: сервер должен отклонять её запрос или выдавать короткую server-gated capability. Иначе rooted-клиент может пропатчить локальный таймер.
 
 ---
 
@@ -494,11 +495,11 @@ CFI не отменяет dynamic instrumentation, но усложняет ма�
 Нужно использовать несколько независимых слоёв:
 
 1. Проверка подписи APK/ELF и package certificate.
-2. Android Key Attestation и Play Integrity на сервере.
+2. Device public key и proof-of-possession на сервере; Key Attestation и Play Integrity только optional signals.
 3. Проверка measurement до выдачи capability.
 4. Runtime code/data integrity в нескольких местах.
 5. Проверка session key epoch.
-6. Heartbeat и server-side revoke.
+6. Server-side revoke и события по уже открытому persistent channel.
 7. Обнаружение несовместимых build IDs.
 8. Проверка control-flow invariants и callback tables.
 9. Срабатывание fail-closed при неполной инициализации.
@@ -556,7 +557,7 @@ CFI не отменяет dynamic instrumentation, но усложняет ма�
 Если какая-либо операция действительно ценна, её нельзя полностью выполнять в patched client. Варианты по степени защиты:
 
 1. Критическая проверка выполняется на сервере.
-2. Ключ выдаётся только после attestation.
+2. Ключ выдаётся после server registration, device proof-of-possession и policy; attestation не обязательна в root-mode.
 3. Сложная часть выполняется в remote service.
 4. Для локального режима используется hardware-backed key и ограниченная capability.
 5. Полный офлайн-режим запрещается для privileged функций.
@@ -700,7 +701,7 @@ Red-team должен попробовать:
 9. загрузить старый APK на новую версию игры;
 10. сделать repack APK с изменённым native ELF;
 11. запустить на emulator/root/debug build;
-12. отключить heartbeat после получения capability.
+12. проверить, что отменённый или истёкший grant отклоняется сервером после получения capability.
 
 ### 13.3 Acceptance criteria для практического 10/10
 
@@ -735,18 +736,18 @@ Red-team должен попробовать:
 
 1. Ввести canonical CBOR/Protobuf grant.
 2. Связать grant с app measurement, device key, game build и nonce.
-3. Ввести короткий TTL и refresh.
+3. Ввести server-issued 24-hour grant и renewal только при истечении или явном запросе.
 4. Добавить server-side replay cache.
 5. Ввести key epoch и revocation.
 6. Перейти на отдельные ключи для каждого purpose.
 
-### Этап 2 — аппаратная идентичность
+### Этап 2 — криптографическая идентичность
 
-1. Создавать ключ в Android Keystore/StrongBox.
-2. Добавить Key Attestation.
-3. Добавить Play Integrity.
-4. Проверять package certificate и signing digest на сервере.
-5. Запретить выдачу capability для неизвестного measurement.
+1. Создавать device key с приоритетом Android Keystore.
+2. Использовать device public key и proof-of-possession.
+3. Не требовать TEE, StrongBox, Key Attestation или Play Integrity для root-mode.
+4. Проверять package certificate и signing digest, если они доступны как server policy signal.
+5. Запрещать выдачу capability для неизвестного build ID или отозванного устройства.
 
 ### Этап 3 — hardened build
 
@@ -773,60 +774,74 @@ Red-team должен попробовать:
 Если можно сделать только пять вещей, порядок должен быть таким:
 
 1. **Убрать доверие к локальному auth state.**
-2. **Не выдавать ценную capability без server-side app/device attestation.**
+2. **Не выдавать ценную capability без server-side device binding и proof-of-possession.**
 3. **Удалить master secrets из ELF.**
 4. **Сделать grant короткоживущим, одноразовым и привязанным к устройству/сборке.**
 5. **Перенести критические решения и revoke на сервер.**
 
 Если можно сделать десять вещей, добавить:
 
-6. Android Keystore/StrongBox.
-7. Play Integrity и Key Attestation.
+6. Android Keystore, если доступен, и software fallback с повышенным риском.
+7. Optional risk signals без обязательного hardware gate.
 8. HSM/KMS для signing keys.
 9. CFI/PAC/BTI/RELRO/stack hardening.
 10. Независимый red-team аудит и автоматические patch tests.
 
 ---
 
-## 16. Что даст настоящий практический «10/10»
+## 16. Нормативный flow запросов и проверки времени
 
-Итоговая схема должна выглядеть так:
+Для приложения действует следующий минимальный сетевой flow:
 
 ```text
-APK/ELF подписан
-        |
-        v
-Android Key Attestation + Play Integrity
-        |
-        v
-сервер проверяет build/device/user/game fingerprint
-        |
-        v
-сервер выдаёт capability на 5–15 минут
-        |
-        v
-capability привязана к nonce, key ID, measurement и game build
-        |
-        v
-клиент получает только минимальные данные
-        |
-        v
-heartbeat + revoke + key epoch
+install or re-enrollment
+    -> one registration request
+        -> one device-bound grant request
+            -> local countdown from server expires_at
+                -> optional grant_expired event on an existing channel
+                    -> one expiry/renewal request at zero
 ```
 
-При этом:
+### 16.1 Какие запросы выполняются
 
-- зашифрованный payload не содержит универсального master;
-- локальный `AUTH_OK` не даёт доступа;
-- beta/release fallback не выдаёт capability;
-- старый grant нельзя повторно использовать;
-- patched APK не проходит attestation;
-- сервер может отключить устройство, версию или лицензию без обновления клиента;
-- компрометация одной сессии не компрометирует весь продукт.
+| Событие | Запрос | Частота |
+|---|---|---|
+| первая установка или re-enrollment | `register_device` | один раз на identity key |
+| получение или продление grant | `issue_grant` / `renew_grant` | один раз на 24 часа или по явному renewal |
+| команда Telegram-бота | `status` | только по команде пользователя |
+| окончание локального countdown | `status` или `renew_grant` | один раз на границе истечения, если нет push/event channel |
+| критическая server-backed операция | запрос операции | по факту операции |
+| revoke | server-side event или отклонение следующего запроса | без polling |
 
-**Честная оценка:** чисто клиентская обфускация и seal могут дать примерно 6–7/10 против массового патчинга. Практические 9–10/10 требуют server-authoritative архитектуры, hardware-backed identity, коротких capability и защищённого процесса выпуска. ChaCha20/XChaCha20, AES-GCM или другой примитив сами по себе не поднимут оценку, если атакующий может заменить код, который принимает решение о доверии.
+Не делать:
 
----
+- запрос на каждый кадр или каждую секунду;
+- polling статуса каждые 30–60 секунд;
+- отдельный heartbeat только ради отображения таймера;
+- повторный `status` и `renew` одновременно для одного события;
+- повторную регистрацию device key при каждом запуске.
+
+### 16.2 Как проверяется время
+
+1. Backend при выпуске grant сам записывает `issued_at` и `expires_at` по server clock.
+2. Backend подписывает grant вместе с `grant_id`, device public key hash, build ID и `key_epoch`.
+3. Клиент использует `expires_at` только для display countdown.
+4. Сервер считает grant истёкшим, когда `server_now >= expires_at`.
+5. После этого сервер отклоняет grant независимо от часов телефона, локального countdown и содержимого клиента.
+6. Клиент получает `EXPIRED` через событие по уже открытому WebSocket/persistent channel либо одним запросом на границе истечения.
+7. Новый grant выдаётся только после новой server validation и proof-of-possession.
+
+Обычный HTTP backend не может сам отправить сообщение клиенту без открытого канала. Если постоянного канала нет, сервер не «звонит» клиенту: клиент делает один запрос в момент окончания. Это не polling и не создаёт постоянную нагрузку.
+
+### 16.3 Что нельзя защищать только локальным таймером
+
+Если после одной выдачи 24-hour grant весь privileged функционал работает полностью офлайн внутри rooted-клиента, атакующий может заменить локальную проверку `expires_at` на бесконечную. Поэтому для защиты от такого патча критическая операция должна либо:
+
+- проходить через server-backed запрос, где сервер проверяет срок;
+- использовать короткую server-gated capability, которую нельзя продлить локально;
+- быть отключена при отсутствии подтверждения от уже открытого persistent channel.
+
+Push/event и отображаемый таймер улучшают UX, но не заменяют серверную проверку. Только backend может быть источником истины для истечения.
 
 ## 17. Спецификация ключа устройства и 24-часового доступа
 
@@ -912,19 +927,18 @@ device_id = BLAKE2b(app_id || device_public_key)
 
 1. Сервер создаёт одноразовый `registration_nonce`.
 2. Клиент генерирует ECDSA P-256 key pair в Android Keystore.
-3. Клиент получает certificate chain attestation.
-4. Клиент подписывает `registration_nonce || app_id || build_id` приватным ключом.
+3. Клиент подписывает `registration_nonce || app_id || build_id` приватным ключом.
+4. Если attestation доступна, клиент может добавить её как optional evidence.
 5. Клиент отправляет на сервер:
    - license key;
    - public key;
-   - certificate chain;
    - подпись challenge;
    - package name;
    - app version;
    - build ID;
    - game fingerprint;
    - Play Integrity token, если доступен.
-6. Сервер проверяет chain, подпись, nonce, build policy и лицензию.
+6. Сервер проверяет подпись, nonce, build policy и лицензию; optional evidence не является обязательным gate.
 7. Сервер создаёт запись устройства и возвращает `device_id`.
 
 Приватный ключ нельзя сериализовать в файл, отправлять на сервер или помещать в native ELF.
@@ -1202,7 +1216,7 @@ Private key не экспортировать и не сохранять в от
 
 10. Если срок grant действительно закончился, показывать «Ключ истёк». Если сервер недоступен, показывать «Не удалось проверить ключ». Не смешивать эти случаи.
 
-11. Поддержать Android 11+ на устройствах с Google Play, без Google Play, без StrongBox, с TEE, с software-backed Keystore и в root/custom-ROM средах. Не требовать TEE/StrongBox/Play Integrity и не показывать их как три обязательные проверки. При доступности использовать их только как дополнительные risk signals. В software-backed и root-средах использовать короткий device-bound grant, а не fake trusted verdict.
+11. Поддержать Android 11+ на устройствах с Google Play, без Google Play, без StrongBox, с TEE, с software-backed Keystore и в root/custom-ROM средах. Не требовать TEE/StrongBox/Play Integrity и не показывать их как три обязательные проверки. При доступности использовать их только как дополнительные risk signals. В software-backed и root-средах использовать server-issued device-bound grant с обычным TTL 24 часа; сервер может выбрать более короткий TTL только как отдельную risk policy, а не как локальное продление. Не использовать fake trusted verdict.
 
 12. Так как приложение использует root, не заявлять, что client-side anti-patch возможен на 100 процентов. Защитить anti-cloning и device binding: root-режим должен получать короткоживущие scoped capabilities и не должен получать universal master key.
 
@@ -1212,7 +1226,7 @@ Private key не экспортировать и не сохранять в от
 
 15. Не передавать клиенту offsets всех версий. Выдавать только минимальный набор для текущего app/game build и текущих permissions. Не оставлять production beta fallback, который позволяет работать без server grant.
 
-16. Ввести server endpoints или эквивалентный строгий API для device registration, grant issue, grant renewal, heartbeat и revoke. Формат должен быть canonical CBOR, Protobuf или строгий бинарный формат. Не строить security-critical протокол на свободных строках без canonical encoding.
+16. Ввести server endpoints или эквивалентный строгий API для device registration, grant issue, grant renewal, expiry-event и revoke. Формат должен быть canonical CBOR, Protobuf или строгий бинарный формат. Не строить security-critical протокол на свободных строках без canonical encoding.
 
 17. Добавить replay cache, rate limit, key_epoch rotation, build revoke, device revoke, license revoke и audit telemetry без plaintext private keys, tokens или offsets в логах.
 
