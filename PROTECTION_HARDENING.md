@@ -176,32 +176,23 @@
 
 Приватный ключ не должен генерироваться в `randombytes_buf()` внутри обычной native memory и не должен сохраняться как файл, зашифрованный ключом из того же процесса.
 
-### 4.2 Key Attestation
+### 4.2 Аппаратные сигналы не являются обязательным gate
 
-Во время регистрации сервер должен получить цепочку attestation certificate и проверить:
+Key Attestation, TEE, StrongBox и Play Integrity не должны быть обязательными условиями запуска или выдачи root-mode ключа. Для приложения, которое по дизайну работает с root, эти сигналы не дают доказательства неизменности native-процесса.
 
-- hardware-backed уровень (`TEE`/`StrongBox`);
-- `verifiedBootState`;
-- `deviceLocked`;
-- application package name;
-- digest сертификата подписи приложения;
-- challenge, связанный с серверной сессией;
-- отсутствие rollback к старой версии;
-- отсутствие неподдерживаемого состояния устройства.
+Если такие сигналы доступны, их можно отправлять на сервер как telemetry/risk signal. Нельзя:
 
-Attestation нужно проверять **на сервере**, а не принимать решение в клиенте.
+- показывать пользователю три обязательные галочки TEE/StrongBox/Play Integrity;
+- блокировать Android 11 только из-за отсутствия StrongBox;
+- требовать Google Play для работы root-mode;
+- считать `isInsideSecureHardware`, `integrity_ok` или локальный verdict корнем доверия;
+- заявлять, что прошедшая attestation делает rooted-процесс непатчимым.
 
-### 4.3 Play Integrity
+Основой защиты должны быть device public key, proof-of-possession, серверная привязка, 24-hour grant и revoke.
 
-Для распространения через Google Play дополнительно использовать Play Integrity API:
+### 4.3 Опциональные проверки
 
-- `appIntegrity` — подлинность приложения и сертификата;
-- `accountDetails` — состояние аккаунта;
-- `deviceIntegrity` — уровень целостности устройства;
-- `appAccessRiskVerdict` — когда доступен для целевой конфигурации;
-- nonce от сервера, а не timestamp, созданный клиентом.
-
-Play Integrity не является единственным слоем защиты, но сильно повышает стоимость запуска patched APK на обычных устройствах.
+При наличии Google Play или OEM attestation backend может сохранить результат как дополнительный риск-сигнал. Отсутствие сигнала переводит устройство в обычный root-compatible режим, а не в ошибку приложения.
 
 ### 4.4 Важное ограничение
 
@@ -1072,59 +1063,66 @@ KEY_EPOCH_REVOKED
 
 ## 18. Совместимость с Android 11 и выше
 
-### 18.1 Базовый минимум
+### 18.1 Политика для root-приложения
 
-Для целевой совместимости использовать Android 11/API 30 как минимальную версию приложения. Не требовать StrongBox как обязательное условие.
+Минимальная версия — Android 11/API 30. Приложение не должно требовать TEE, StrongBox, Key Attestation или Google Play для запуска и для базовой root-mode авторизации. Эти функции могут использоваться только как дополнительные сигналы, если они есть.
 
-Порядок выбора backend:
+Не добавлять в UI проверки вида:
 
 ```text
-StrongBox available and policy allows
-    -> StrongBox key
-
-StrongBox unavailable
-    -> TEE-backed Keystore key
-
-TEE attestation unavailable
-    -> compatibility policy or deny full capability
+TEE: passed
+StrongBox: passed
+Play Integrity: passed
 ```
 
-Ошибку отсутствия StrongBox нельзя считать ошибкой приложения. Это нормальный результат feature detection.
+Для пользователя показывать только полезное состояние лицензии:
 
-### 18.2 Матрица режимов
+```text
+Ключ: активен
+Привязка: да
+Истекает через: 23:59:59
+```
 
-| Устройство | Device key | Attestation | Политика |
-|---|---:|---:|---|
-| Android 11+, TEE, Google Play | Да | Да | Full или root-risk policy |
-| Android 11+, StrongBox | Да | Да | Усиленный режим |
-| Android 11+, TEE без StrongBox | Да | Да | Обычный полный режим |
-| Android 11+, software-backed | Да | Нет/слабая | Ограниченный режим |
-| Android 11 без Google Play | Да | Зависит от OEM | Отдельная compatibility policy |
-| root/custom ROM | Да | Может не пройти | Root-risk/ограниченный режим |
-| repacked APK | Возможно | App integrity fail | Отказ |
-| эмулятор | Возможно | Обычно слабая | Отказ или demo |
+### 18.2 Выбор identity key
 
-### 18.3 Что обязательно тестировать
+Порядок выбора ключа:
 
-Минимальная матрица реальных устройств:
+1. Попытаться создать non-exportable device key в Android Keystore.
+2. Если Keystore доступен, использовать его public key как identity.
+3. Если конкретная прошивка не поддерживает нужный алгоритм, использовать совместимый ECDSA P-256 вариант.
+4. Если аппаратный backend отсутствует, не блокировать приложение: использовать software key только в root-compatible policy и уменьшить срок server grant.
+5. Никогда не выдавать software-backed key тот же уровень доверия, что и hardware-backed key.
 
-- Pixel на Android 11;
-- Samsung на Android 11;
-- Xiaomi/Redmi на Android 11;
+Private key не экспортировать и не сохранять в открытом файле. При software fallback честно считать, что root может скопировать ключ; защита в этом режиме ограничивается server binding, коротким TTL и revoke.
+
+### 18.3 Матрица поведения
+
+| Среда | Запуск | Device binding | Три hardware-проверки | Server policy |
+|---|---:|---:|---:|---|
+| Android 11+ с Keystore | Да | Да | Не требуются | Обычный root-mode |
+| Android 11+ без StrongBox | Да | Да | Не требуются | Обычный root-mode |
+| Android 11+ без Google Play | Да | Да | Не требуются | Root-mode через собственный backend |
+| Software-backed key | Да | Да | Не требуются | Короткий grant и повышенный риск |
+| Root/custom ROM | Да | Да | Не требуются | Root-compatible policy |
+| Repacked APK | Возможно | Да/нет | Не требуются | Решение по server build policy |
+| Эмулятор | Возможно | Да/нет | Не требуются | Отказ или demo policy |
+
+### 18.4 Тестирование совместимости
+
+Проверить на реальных устройствах:
+
+- Pixel, Samsung и Xiaomi на Android 11;
 - бюджетный OEM без StrongBox;
 - устройство без Google Play;
-- unlocked bootloader;
-- root/Magisk;
+- root/Magisk и custom ROM;
+- software-backed Keystore;
 - factory reset;
-- переустановка приложения;
-- восстановление backup;
+- переустановка и backup restore;
 - смена системного времени;
 - отсутствие сети во время продления;
 - истечение grant во время активной сессии.
 
-Цель совместимости — чтобы приложение запускалось везде, где это разрешено политикой, а не чтобы каждое устройство получало одинаковый уровень доверия.
-
----
+Критерий совместимости — корректный запуск, регистрация device key, привязка и выдача root-mode grant. Отсутствие TEE/StrongBox/Play Integrity не должно само по себе ломать приложение.
 
 ## 19. Обязательные изменения в исходниках
 
@@ -1188,9 +1186,9 @@ TEE attestation unavailable
 
 1. Не использовать HWID-файл, serial, MAC, IMEI, IMSI, ro.serialno, Android ID или другой системный файл как корень доверия. На rooted Android нет гарантированно неизменяемого файла, уникального для каждого устройства.
 
-2. Создавать device identity key в Android Keystore. Использовать non-exportable ECDSA P-256 key, совместимый с Android 11/API 30. StrongBox использовать опционально. Если StrongBox отсутствует, корректно переходить к TEE. Не блокировать все устройства только из-за отсутствия StrongBox.
+2. Создавать device identity key с приоритетом Android Keystore и non-exportable ECDSA P-256 на Android 11/API 30. StrongBox, TEE и software-backed fallback считать вариантами реализации, а не обязательными условиями. Если Keystore не поддерживает нужный вариант, использовать совместимый root-mode fallback с коротким grant и повышенным риском.
 
-3. Получать certificate chain Key Attestation и отправлять её на сервер. Attestation проверять только на сервере. Локальные поля isInsideSecureHardware, integrity_ok и device_id не считать доказательством доверия.
+3. Не вводить обязательную проверку трёх условий TEE/StrongBox/Play Integrity. Не добавлять эти проверки как галочки в UI и не блокировать root-mode из-за их отсутствия. Если Key Attestation или Play Integrity доступны, передавать их серверу только как дополнительные risk signals. Локальные поля isInsideSecureHardware, integrity_ok и device_id не считать доказательством доверия.
 
 4. Использовать device_id как hash app_id и device public key. Не показывать этот идентификатор пользователю и не выдавать его в ошибках.
 
@@ -1202,11 +1200,11 @@ TEE attestation unavailable
 
 8. Действительность ключа определять по времени сервера, а не по часам телефона. После 24 часов старый grant должен возвращаться как expired/revoked. Должна быть аварийная server-side revoke возможность через key_epoch и denylist.
 
-9. Если license key неверен, привязан к другому устройству, не зарегистрирован, attestation провалена, обнаружен replay или build отозван, наружу всегда возвращать одинаковое сообщение: «Неверный ключ». Не писать пользователю HWID mismatch, device mismatch, device id, public key hash или server reason.
+9. Если license key неверен, привязан к другому устройству, не зарегистрирован, server policy не разрешает доступ, обнаружен replay или build отозван, наружу всегда возвращать одинаковое сообщение: «Неверный ключ». Не писать пользователю HWID mismatch, device mismatch, device id, public key hash или server reason.
 
 10. Если срок grant действительно закончился, показывать «Ключ истёк». Если сервер недоступен, показывать «Не удалось проверить ключ». Не смешивать эти случаи.
 
-11. Поддержать Android 11+ на устройствах с Google Play, без Google Play, без StrongBox, с TEE, с software-backed Keystore и в root/custom-ROM средах. Полный доступ выдавать только по серверной policy. В средах без attestation использовать compatibility/root-risk режим или отказ, но не подделывать trusted verdict.
+11. Поддержать Android 11+ на устройствах с Google Play, без Google Play, без StrongBox, с TEE, с software-backed Keystore и в root/custom-ROM средах. Не требовать TEE/StrongBox/Play Integrity и не показывать их как три обязательные проверки. При доступности использовать их только как дополнительные risk signals. В software-backed и root-средах использовать короткий device-bound grant, а не fake trusted verdict.
 
 12. Так как приложение использует root, не заявлять, что client-side anti-patch возможен на 100 процентов. Защитить anti-cloning и device binding: root-режим должен получать короткоживущие scoped capabilities и не должен получать universal master key.
 
@@ -1222,7 +1220,7 @@ TEE attestation unavailable
 
 18. Проверить итоговый Android/ELF build: PIE, RELRO, NOW, stack protector, FORTIFY, hidden visibility, отсутствие RWX, минимальные exports, отсутствие debug info и test endpoints. Включить CFI/LTO/PAC/BTI только если это совместимо с целевыми Android 11 устройствами.
 
-19. Добавить tests для регистрации, неверного ключа, чужого device key, истёкшего grant, replay, смены времени телефона, отсутствия сети, revoke, key_epoch rotation, переустановки, backup restore, root mode, no-GMS mode, software-backed Keystore и отсутствия StrongBox.
+19. Добавить tests для регистрации, неверного ключа, чужого device key, истёкшего grant, replay, смены времени телефона, отсутствия сети, revoke, key_epoch rotation, переустановки, backup restore, root mode, no-GMS mode, software-backed Keystore и отсутствия StrongBox. Отдельно проверить, что отсутствие TEE/StrongBox/Play Integrity не ломает root-mode UI и server flow.
 
 20. Не делать вид, что backend реализован, если в репозитории нет backend-кода. Если для end-to-end реализации не хватает server части, создай чёткий API contract, migration plan и тестовый mock без production secrets, затем явно укажи, что требуется подключить на сервере.
 
@@ -1232,9 +1230,29 @@ TEE attestation unavailable
 
 23. Не делать offline bypass, unconditional AUTH_OK, fixed production RVA, fake attestation или локальное принятие решения вместо server validation.
 
-24. После реализации запусти доступные тесты и статические проверки, проверь git diff --check, размер и формат итоговых артефактов. Опиши ограничения Android 11, GMS, StrongBox и root режима честно.
+24. После реализации запусти доступные тесты и статические проверки, проверь git diff --check, размер и формат итоговых артефактов. Опиши ограничения Android 11, GMS, optional hardware signals и root режима честно.
 
 25. Работай только в текущей ветке сессии. Не удаляй .git и корень репозитория. В конце создай commit и push только в ветку сессии, затем укажи commit SHA, список изменённых файлов, тесты и ссылку на Pull Request.
+
+26. Создай отдельного асинхронного Python Telegram-бота на aiogram 3.x. Используй httpx.AsyncClient, Pydantic v2, asyncpg или SQLAlchemy 2 async для PostgreSQL, redis.asyncio для locks и rate limits, orjson и uvloop при совместимости. Не использовать синхронный Telegram framework.
+
+27. Бот должен поддерживать /my_key, /key_status, /create_key, /renew_key и /revoke_key, а администраторские команды для статуса, создания, revoke, bind-status и key_epoch. Бот не является источником истины и всегда обращается к backend API.
+
+28. /create_key должен быть идемпотентным. Если у пользователя уже есть активный ключ, не создавать новый и написать «Ключ уже создан», показать статус, binding status и TTL. Параллельные запросы не должны создать два ключа.
+
+29. Новый ключ должен генерироваться backend через CSPRNG с энтропией не менее 256 бит. Бот не должен локально подписывать production grant и не должен хранить private signing key. В базе хранить hash или KMS-encrypted envelope.
+
+30. Добавь status API, который возвращает server_now, expires_at, status, binding_status, masked_device_id, key_epoch и already_exists. Устройство привязывается только после proof-of-possession из приложения. Бот не принимает raw HWID, serial, IMEI, MAC или путь к системному файлу.
+
+31. Добавь в пользовательское меню xvcen.zip auth/status card: «Ключ: активен», «Привязка: да», «Истекает через: HH:MM:SS». Таймер должен обновляться в реальном времени через monotonic clock и синхронизироваться с server time каждые 30–60 секунд. При нуле показывать «Ключ истёк», отключать privileged actions и не продлевать ключ локально.
+
+32. Не добавляй в UI три обязательные проверки TEE/StrongBox/Play Integrity. Root является базовой средой приложения. KeyStore, TEE, StrongBox, Key Attestation и Play Integrity могут быть только optional risk signals и не должны блокировать Android 11+, no-GMS или root-mode.
+
+33. Ошибка чужого устройства, неверной лицензии, replay, неизвестного key_id и server policy должна отображаться как «Неверный ключ». Только реальное истечение отображать как «Ключ истёк». Сетевую ошибку отображать отдельно.
+
+34. Добавь tests для двойного create, TTL countdown, expires_at, revoke, binding к другому device key, no-GMS, root/custom ROM, software-backed key, отсутствия StrongBox и отсутствия optional hardware signals. Не считать отсутствие этих сигналов ошибкой root-mode.
+
+35. Не добавляй комментарии в Python, Java, Kotlin, C, C++, SQL, shell или конфигурационные файлы. Код должен быть без комментариев. Документация остаётся в Markdown.
 ```
 
 ---
@@ -1252,3 +1270,418 @@ TEE attestation unavailable
 ```
 
 Это достижимо на Android 11+ при многоуровневой policy. Абсолютная защита runtime-памяти rooted-клиента недостижима, поэтому её нельзя обещать пользователю или считать выполненной только из-за Keystore, StrongBox, Play Integrity или ChaCha20.
+
+---
+
+## 22. Python-бот для управления ключами
+
+### 22.1 Назначение
+
+Нужен отдельный Telegram-бот для self-service и администрирования лицензий. Бот не должен сам решать, действителен ли ключ. Источником истины остаётся backend API и база данных.
+
+Бот должен уметь:
+
+- выдать пользователю его ключ;
+- показать статус ключа;
+- показать, через сколько он истечёт;
+- показать, есть ли привязка к устройству;
+- показать masked `device_id` или `device_key_id`, но не raw HWID;
+- создать ключ для пользователя;
+- не создавать второй активный ключ, если один уже существует;
+- показать сообщение `Ключ уже создан` и оставшийся TTL;
+- показать `Ключ истёк` после окончания срока;
+- отозвать ключ при наличии прав;
+- принудительно обновить или продлить ключ по серверной policy;
+- показать историю последних операций без приватных данных.
+
+### 22.2 Рекомендуемый стек
+
+Для Telegram-бота использовать асинхронный стек:
+
+- Python 3.12+;
+- `aiogram 3.x` для Telegram Bot API;
+- `httpx.AsyncClient` для backend API;
+- `pydantic v2` и `pydantic-settings` для схем и конфигурации;
+- PostgreSQL через `asyncpg` или SQLAlchemy 2 async;
+- `redis.asyncio` для rate limit, FSM и коротких locks;
+- `orjson` для сериализации;
+- `uvloop` на Linux, если он доступен и протестирован.
+
+`aiogram 3.x` использовать как основной Telegram framework, потому что он асинхронный, поддерживает routers, middleware, FSM и callback handlers. Не использовать синхронный polling framework для production-бота.
+
+### 22.3 Безопасность бота
+
+Telegram-бот не должен содержать:
+
+- private server signing key;
+- master secret;
+- device private key;
+- универсальный decrypt key;
+- доступ к базе без API policy;
+- код, который сам подписывает production grant.
+
+Бот получает доступ через backend API с отдельным service credential:
+
+- credential хранится в environment secret manager;
+- разрешены только необходимые endpoints;
+- есть отдельный `bot_service_id`;
+- все действия имеют audit event;
+- есть rate limit по Telegram user ID и chat ID;
+- административные команды доступны только allowlist Telegram IDs и ролям;
+- опасные действия требуют подтверждения callback-кнопкой;
+- service credential можно отозвать без выпуска нового клиента.
+
+Токены и ключи нельзя писать в stdout, systemd logs, Redis без TTL или Telegram callback data.
+
+### 22.4 Команды пользователя
+
+Минимальный набор:
+
+```text
+/start
+/my_key
+/key_status
+/create_key
+/renew_key
+/revoke_key
+/help
+```
+
+Пример логики:
+
+| Команда | Результат |
+|---|---|
+| `/my_key` | masked key, статус, bind status, TTL |
+| `/key_status` | статус без раскрытия полного ключа |
+| `/create_key` | создание ключа или `Ключ уже создан` |
+| `/renew_key` | новый grant после server policy |
+| `/revoke_key` | revoke после подтверждения |
+| `/help` | описание допустимых действий |
+
+Администраторам дополнительно:
+
+```text
+/admin/key_status <user>
+/admin/create_key <user>
+/admin/revoke_key <key_id>
+/admin/bind_status <key_id>
+/admin/rotate_epoch
+/admin/audit
+```
+
+Не принимать raw HWID как аргумент Telegram-команды. Привязка выполняется только через приложение и proof-of-possession.
+
+### 22.5 Идемпотентное создание ключа
+
+`/create_key` должен быть идемпотентным.
+
+Алгоритм:
+
+1. Бот отправляет backend `telegram_user_id`, account ID и `idempotency_key`.
+2. Backend ищет активный grant пользователя.
+3. Если активный grant существует, новый ключ не создаётся.
+4. Backend возвращает `already_exists=true`, `key_id`, `status`, `expires_at` и bind status.
+5. Бот показывает:
+
+```text
+Ключ уже создан
+Статус: активен
+Привязка: да
+Истекает через: 17:42:09
+```
+
+6. Если активного grant нет, backend создаёт новый 256-bit random license secret через CSPRNG.
+7. Backend сохраняет hash ключа, а plaintext возвращает только по защищённому одноразовому ответу.
+8. Бот показывает новый ключ один раз и предлагает удалить сообщение.
+9. Второй вызов с тем же активным ключом не создаёт дубликат.
+
+Если пользователю нужно снова увидеть ключ, использовать зашифрованное хранилище на backend с KMS envelope encryption. Более безопасный вариант — после создания показывать полный ключ один раз, а затем показывать только mask и `key_id`.
+
+### 22.6 Формат license key
+
+Ключ должен быть удобен для ручного ввода и иметь достаточную энтропию:
+
+```text
+XV-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
+```
+
+Требования:
+
+- не менее 256 бит случайности;
+- CSPRNG из Python `secrets` или server-side CSPRNG;
+- Crockford Base32 или другой формат без неоднозначных символов;
+- prefix не является секретом;
+- сервер хранит только hash или KMS-encrypted envelope;
+- в логах ключ всегда редактируется;
+- в UI ключ маскируется после первого показа.
+
+Не генерировать production license в Telegram-боте локально, если это позволяет обойти audit или server policy. Бот только вызывает backend endpoint.
+
+### 22.7 Проверка привязки к устройству
+
+Backend должен возвращать только безопасный статус:
+
+```text
+binding_status = unbound | bound | revoked | unknown
+```
+
+Для `bound` показывать:
+
+```text
+Привязка: да
+Устройство: 7F3A••••91C2
+```
+
+Для другого устройства не показывать причину:
+
+```text
+Неверный ключ
+```
+
+Не показывать:
+
+- raw public key;
+- raw HWID;
+- serial;
+- IMEI;
+- точный fingerprint;
+- список чужих устройств;
+- внутренний server reason code.
+
+Одна лицензия должна быть привязана к одному разрешённому device key, если серверная policy не разрешает несколько устройств. Перенос должен выполняться отдельной административной операцией с revoke старой привязки.
+
+### 22.8 API бота и backend
+
+Рекомендуемые endpoints:
+
+```text
+POST /v1/bot/me/key/status
+POST /v1/bot/me/key/create
+POST /v1/bot/me/key/renew
+POST /v1/bot/me/key/revoke
+POST /v1/bot/admin/key/status
+POST /v1/bot/admin/key/create
+POST /v1/bot/admin/key/revoke
+POST /v1/bot/admin/key/bind-status
+```
+
+`create` должен принимать `idempotency_key`. `status` должен возвращать `server_now` и `expires_at`, чтобы бот не использовал часы Telegram-сервера или локальное время телефона.
+
+Пример логического ответа:
+
+```text
+{
+  key_id,
+  status,
+  binding_status,
+  masked_device_id,
+  issued_at,
+  expires_at,
+  server_now,
+  key_epoch,
+  already_exists
+}
+```
+
+Backend должен сам вычислять `ttl_seconds = max(0, expires_at - server_now)` и не принимать TTL от бота.
+
+### 22.9 Статусы и сообщения бота
+
+Внутренние состояния:
+
+```text
+ACTIVE
+UNBOUND
+EXPIRED
+REVOKED
+INVALID
+NETWORK_ERROR
+ALREADY_EXISTS
+```
+
+Пользовательские сообщения:
+
+```text
+ACTIVE -> Ключ активен
+UNBOUND -> Ключ создан, но ещё не привязан к устройству
+EXPIRED -> Ключ истёк
+REVOKED -> Ключ отозван
+INVALID -> Неверный ключ
+NETWORK_ERROR -> Не удалось проверить ключ
+ALREADY_EXISTS -> Ключ уже создан
+```
+
+Для `INVALID`, `DEVICE_MISMATCH`, `ATTESTATION_FAILED`, `REPLAY_DETECTED` и неизвестного `key_id` использовать одно внешнее сообщение `Неверный ключ`.
+
+### 22.10 TTL в Telegram-боте
+
+Telegram не предназначен для редактирования сообщения каждую секунду без ограничений. Поэтому:
+
+- при открытии status отправлять `expires_at` и `server_now`;
+- вычислять локальный display countdown от `time.monotonic()`;
+- редактировать сообщение раз в 5–10 секунд;
+- повторно синхронизировать backend раз в 30–60 секунд;
+- при достижении нуля немедленно показать `Ключ истёк`;
+- действительность всё равно проверять backend, а не локальным таймером;
+- не продлевать ключ только потому, что локальный таймер был подменён.
+
+### 22.11 Тесты бота
+
+Обязательные сценарии:
+
+1. Новый пользователь создаёт ключ.
+2. Повторный `/create_key` возвращает `Ключ уже создан`.
+3. Новый ключ имеет срок ровно 24 часа по server time.
+4. `/key_status` показывает правильный TTL.
+5. Countdown обновляется без создания нового ключа.
+6. После истечения отображается `Ключ истёк`.
+7. Ключ другого устройства отображается как `Неверный ключ`.
+8. Revoke немедленно меняет статус.
+9. Повторное нажатие revoke идемпотентно.
+10. Два параллельных `/create_key` создают только один ключ.
+11. Telegram user не из allowlist не получает admin commands.
+12. Bot token и backend credential не попадают в логи.
+13. При недоступном backend бот показывает сетевую ошибку, а не `Неверный ключ`.
+14. Bot не может создать grant без backend.
+
+---
+
+## 23. Меню xvcen.zip и реальный таймер ключа
+
+В пользовательском меню `xvcen.zip` добавить auth/status card с минимальной информацией:
+
+```text
+Ключ: активен
+Привязка: да
+Истекает через: 23:59:59
+```
+
+Не добавлять в меню TEE, StrongBox, Play Integrity и другие три обязательные проверки. Root является базовой средой приложения.
+
+### 23.1 Данные для UI
+
+Auth layer должен передавать в UI структуру с полями:
+
+```text
+status
+binding_status
+server_now
+expires_at
+grant_id_mask
+renew_allowed
+```
+
+`device_id`, public key, raw license и internal reason code в UI не передавать.
+
+### 23.2 Real-time countdown
+
+При успешной синхронизации сохранить:
+
+```text
+expires_at_server
+server_now_at_sync
+monotonic_at_sync
+```
+
+Каждый кадр вычислять только display value:
+
+```text
+display_remaining = max(0, expires_at_server - server_now_at_sync - (monotonic_now - monotonic_at_sync))
+```
+
+Системные часы телефона не использовать для продления и не считать источником истины. UI-таймер нужен только для отображения.
+
+Обновление:
+
+- перерисовывать countdown в реальном времени;
+- синхронизировать backend каждые 30–60 секунд;
+- при расхождении server time заменять локальную точку отсчёта;
+- при `display_remaining == 0` изменить статус на `Ключ истёк`;
+- отключить привилегированные действия;
+- запустить renewal только через backend;
+- не скрывать истечение изменением локального времени.
+
+### 23.3 Состояния меню
+
+```text
+NO_KEY
+CHECKING
+ACTIVE
+UNBOUND
+EXPIRED
+REVOKED
+NETWORK_ERROR
+```
+
+UI должен показывать:
+
+| State | Текст |
+|---|---|
+| `NO_KEY` | `Ключ не создан` |
+| `CHECKING` | `Проверка ключа...` |
+| `ACTIVE` | `Ключ активен` |
+| `UNBOUND` | `Ключ создан, но не привязан` |
+| `EXPIRED` | `Ключ истёк` |
+| `REVOKED` | `Ключ отозван` |
+| `NETWORK_ERROR` | `Не удалось проверить ключ` |
+
+Для чужого или неверного ключа не отображать HWID mismatch. Использовать `Неверный ключ`.
+
+### 23.4 Где менять исходники
+
+Если исходники доступны, изменить:
+
+- `jni/src/Auth/auth.cpp` для server status, grant TTL, binding и renewal;
+- `jni/src/main.cpp` для auth/status card и real-time countdown;
+- API/backend для key issue, status, renew и revoke;
+- Python bot в отдельном backend/tooling каталоге;
+- build pipeline так, чтобы в xvcen.zip попадала новая UI и Auth логика.
+
+Не патчить только готовый ELF и не считать, что добавление текста в UI реализует серверную ротацию. После изменений пересобрать приложение, выполнить runtime tests, проверить server flow и только затем обновить release artifact.
+
+---
+
+## 24. Дополнение к prompt для нового AI-чата
+
+В prompt для coding agent обязательно добавить следующие требования:
+
+```text
+26. Создай отдельного асинхронного Python Telegram-бота на aiogram 3.x. Используй httpx.AsyncClient, Pydantic v2, asyncpg или SQLAlchemy 2 async для PostgreSQL, redis.asyncio для locks и rate limits, orjson и uvloop при совместимости. Не использовать синхронный Telegram framework.
+
+27. Бот должен поддерживать /my_key, /key_status, /create_key, /renew_key и /revoke_key, а администраторские команды для статуса, создания, revoke, bind-status и key_epoch. Бот не является источником истины и всегда обращается к backend API.
+
+28. /create_key должен быть идемпотентным. Если у пользователя уже есть активный ключ, не создавать новый и написать «Ключ уже создан», показать статус, binding status и TTL. Параллельные запросы не должны создать два ключа.
+
+29. Новый ключ должен генерироваться backend через CSPRNG с энтропией не менее 256 бит. Бот не должен локально подписывать production grant и не должен хранить private signing key. В базе хранить hash или KMS-encrypted envelope.
+
+30. Добавь status API, который возвращает server_now, expires_at, status, binding_status, masked_device_id, key_epoch и already_exists. Устройство привязывается только после proof-of-possession из приложения. Бот не принимает raw HWID, serial, IMEI, MAC или путь к системному файлу.
+
+31. Добавь в пользовательское меню xvcen.zip auth/status card: «Ключ: активен», «Привязка: да», «Истекает через: HH:MM:SS». Таймер должен обновляться в реальном времени через monotonic clock и синхронизироваться с server time каждые 30–60 секунд. При нуле показывать «Ключ истёк», отключать privileged actions и не продлевать ключ локально.
+
+32. Не добавляй в UI три обязательные проверки TEE/StrongBox/Play Integrity. Root является базовой средой приложения. KeyStore, TEE, StrongBox, Key Attestation и Play Integrity могут быть только optional risk signals и не должны блокировать Android 11+, no-GMS или root-mode.
+
+33. Ошибка чужого устройства, неверной лицензии, replay, неизвестного key_id и server policy должна отображаться как «Неверный ключ». Только реальное истечение отображать как «Ключ истёк». Сетевую ошибку отображать отдельно.
+
+34. Добавь tests для двойного create, TTL countdown, expires_at, revoke, binding к другому device key, no-GMS, root/custom ROM, software-backed key, отсутствия StrongBox и отсутствия optional hardware signals. Не считать отсутствие этих сигналов ошибкой root-mode.
+
+35. Не добавляй комментарии в Python, Java, Kotlin, C, C++, SQL, shell или конфигурационные файлы. Код должен быть без комментариев. Документация остаётся в Markdown.
+```
+
+---
+
+## 25. Итоговая формулировка для root-режима
+
+Для этого проекта не нужна декоративная проверка трёх флажков TEE/StrongBox/Play Integrity. Она не доказывает безопасность rooted native-процесса и будет ломать совместимость.
+
+Практическая схема должна быть такой:
+
+```text
+per-install device key
+    -> server binding
+        -> 24-hour grant
+            -> real server TTL
+                -> real-time UI countdown
+                    -> revoke and key_epoch
+```
+
+Keystore и hardware signals можно использовать, если они есть, но они не должны быть обязательным условием. Главные свойства — уникальная криптографическая identity, привязка grant к public key, серверная проверка, ротация каждые 24 часа, отсутствие HWID-утечек и одинаковая ошибка для чужого устройства.
